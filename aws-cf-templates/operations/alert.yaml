@@ -1,0 +1,94 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Operations: Alert topic, a cloudonaut.io template'
+Metadata:
+  'AWS::CloudFormation::Interface':
+    ParameterGroups:
+    - Label:
+        default: 'Alert Parameters'
+      Parameters:
+      - Email
+      - HttpEndpoint
+      - HttpsEndpoint
+    - Label:
+        default: 'Fallback Parameters'
+      Parameters:
+      - FallbackEmail
+Parameters:
+  Email:
+    Description: 'Optional email address that will receive alerts'
+    Type: String
+  HttpEndpoint:
+    Description: 'Optional HTTP endpoint that will receive alerts via POST requests'
+    Type: String
+  HttpsEndpoint:
+    Description: 'Optional HTTPS endpoint that will receive alerts via POST requests  (can be marbot.io)'
+    Type: String
+  FallbackEmail:
+    Description: 'Optional email address that will receive alerts if alerts can not be delivered'
+    Type: String
+Conditions:
+  HasEmail: !Not [!Equals [!Ref Email, '']]
+  HasHttpEndpoint: !Not [!Equals [!Ref HttpEndpoint, '']]
+  HasHttpsEndpoint: !Not [!Equals [!Ref HttpsEndpoint, '']]
+  HasFallbackEmail: !Not [!Equals [!Ref FallbackEmail, '']]
+Resources:
+  Topic:
+    Type: 'AWS::SNS::Topic'
+    Properties: {}
+  FallbackTopic:
+    Type: 'AWS::SNS::Topic'
+    Properties: {}
+  NumberOfNotificationsFailedTooHighAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmDescription: 'Alerts could not be delivered'
+      Namespace: 'AWS/SNS'
+      MetricName: NumberOfNotificationsFailed
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: 0
+      AlarmActions:
+      - !Ref FallbackTopic
+      Dimensions:
+      - Name: TopicName
+        Value: !GetAtt Topic.TopicName
+  EmailSubscription:
+    Condition: HasEmail
+    Type: 'AWS::SNS::Subscription'
+    Properties:
+      Endpoint: !Ref Email
+      Protocol: email
+      TopicArn: !Ref Topic
+  HttpEndpointSubscription:
+    Condition: HasHttpEndpoint
+    Type: 'AWS::SNS::Subscription'
+    Properties:
+      Endpoint: !Ref HttpEndpoint
+      Protocol: http
+      TopicArn: !Ref Topic
+  HttpsEndpointSubscription:
+    Condition: HasHttpsEndpoint
+    Type: 'AWS::SNS::Subscription'
+    Properties:
+      Endpoint: !Ref HttpsEndpoint
+      Protocol: https
+      TopicArn: !Ref Topic
+  FallbackEmailSubscription:
+    Condition: HasFallbackEmail
+    Type: 'AWS::SNS::Subscription'
+    Properties:
+      Endpoint: !Ref FallbackEmail
+      Protocol: email
+      TopicArn: !Ref FallbackTopic
+Outputs:
+  TemplateID:
+    Description: 'cloudonaut.io template id'
+    Value: 'operations/alert'
+  TopicARN:
+    Description: 'The ARN of the alert topic.'
+    Value: !Ref Topic
+    Export:
+      Name: !Sub '${AWS::StackName}-TopicARN'

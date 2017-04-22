@@ -1,0 +1,815 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'WordPress: fault tolerant and scalable, a cloudonaut.io template'
+Metadata:
+  'AWS::CloudFormation::Interface':
+    ParameterGroups:
+    - Label:
+        default: 'Parent Stacks'
+      Parameters:
+      - ParentVPCStack
+      - ParentSSHBastionStack
+      - ParentAuthProxyStack
+      - ParentAlertStack
+    - Label:
+        default: 'Domain Name and SSL certificates'
+      Parameters:
+      - DomainName
+      - CloudFrontAcmCertificate
+      - ElbAcmCertificate
+    - Label:
+        default: 'WordPress Parameters'
+      Parameters:
+      - BlogTitle
+      - BlogAdminUsername
+      - BlogAdminPassword
+      - BlogAdminEMail
+    - Label:
+        default: 'EC2 Parameters'
+      Parameters:
+      - WebServerKeyName
+      - WebServerIAMUserSSHAccess
+      - WebServerInstanceType
+      - WebServerLogsRetentionInDays
+      - NewRelicLicenseKey
+    - Label:
+        default: 'Database Parameters'
+      Parameters:
+      - DBServerInstanceType
+Parameters:
+  ParentVPCStack:
+    Description: 'Stack name of parent VPC stack based on vpc/vpc-*azs.yaml template.'
+    Type: String
+  ParentSSHBastionStack:
+    Description: 'Optional but recommended stack name of parent SSH bastion host/instance stack based on vpc/vpc-ssh-bastion.yaml template.'
+    Type: String
+    Default: ''
+  ParentAuthProxyStack:
+    Description: 'Optional stack name of parent auth proxy stack based on security/auth-proxy-*.yaml template.'
+    Type: String
+    Default: ''
+  ParentAlertStack:
+    Description: 'Optional but recommended stack name of parent alert stack based on operations/alert.yaml template.'
+    Type: String
+    Default: ''
+  DomainName:
+    Description: 'The primary domain name of the blog.'
+    Type: String
+  CloudFrontAcmCertificate:
+    Description: 'The ACM Certificate ARN of certificate for the CloudFront distribution.Must be created in the us-east-1 region!'
+    Type: String
+  ElbAcmCertificate:
+    Description: 'The ACM Certificate ARN of certificate for the ELB. Must be created in the same region as this stack!'
+    Type: String
+  BlogTitle:
+    Description: 'The title of the WordPress blog.'
+    Type: String
+    Default: 'Just another WordPress blog'
+  BlogAdminUsername:
+    Description: 'A username for the WordPress admin.'
+    Type: String
+    Default: admin
+  BlogAdminPassword:
+    Description: 'A password for the WordPress admin.'
+    Type: String
+    NoEcho: true
+  BlogAdminEMail:
+    Description: 'The email address of the WordPress admin.'
+    Type: String
+  BlogVersion:
+    Description: 'WordPress version number'
+    Type: String
+    Default: '4.7.4'
+    ConstraintDescription: 'x.y.z'
+    AllowedPattern: '[0-9]+\.[0-9]+\.[0-9]+'
+  WebServerKeyName:
+    Description: 'Optional key pair of the ec2-user to establish a SSH connection to the web server.'
+    Type: String
+    Default: ''
+  WebServerIAMUserSSHAccess:
+    Description: 'Synchronize public keys of IAM users to enable personalized SSH access (Doc: https://cloudonaut.io/manage-aws-ec2-ssh-access-with-iam/).'
+    Type: String
+    Default: false
+    AllowedValues:
+    - true
+    - false
+  WebServerInstanceType:
+    Description: 'The instance type of web servers (e.g. t2.micro).'
+    Type: String
+    Default: 't2.micro'
+  WebServerLogsRetentionInDays:
+    Description: 'Specifies the number of days you want to retain log events.'
+    Type: Number
+    Default: 14
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+  DBServerInstanceType:
+    Description: 'The instance type of database server (e.g. db.t2.micro).'
+    Type: String
+    Default: 'db.t2.micro'
+  NewRelicLicenseKey:
+    Description: 'Optional New Relic License Key will install the New Relic Servers for Linux agent.'
+    Type: String
+    Default: ''
+    NoEcho: true
+Mappings:
+  RegionMap:
+    'ap-south-1':
+      AMI: 'ami-52c7b43d'
+    'eu-west-2':
+      AMI: 'ami-b6daced2'
+    'eu-west-1':
+      AMI: 'ami-01ccc867'
+    'ap-northeast-2':
+      AMI: 'ami-9d15c7f3'
+    'ap-northeast-1':
+      AMI: 'ami-923d12f5'
+    'sa-east-1':
+      AMI: 'ami-37cfad5b'
+    'ca-central-1':
+      AMI: 'ami-0bd66a6f'
+    'ap-southeast-1':
+      AMI: 'ami-fc5ae39f'
+    'ap-southeast-2':
+      AMI: 'ami-162c2575'
+    'eu-central-1':
+      AMI: 'ami-b968bad6'
+    'us-east-1':
+      AMI: 'ami-c58c1dd3'
+    'us-east-2':
+      AMI: 'ami-4191b524'
+    'us-west-1':
+      AMI: 'ami-7a85a01a'
+    'us-west-2':
+      AMI: 'ami-4836a428'
+Conditions:
+  HasKeyName: !Not [!Equals [!Ref WebServerKeyName, '']]
+  HasIAMUserSSHAccess: !Equals [!Ref WebServerIAMUserSSHAccess, 'true']
+  HasSSHBastionSecurityGroup: !Not [!Equals [!Ref ParentSSHBastionStack, '']]
+  HasNotSSHBastionSecurityGroup: !Equals [!Ref ParentSSHBastionStack, '']
+  HasAuthProxySecurityGroup: !Not [!Equals [!Ref ParentAuthProxyStack, '']]
+  HasNotAuthProxySecurityGroup: !Equals [!Ref ParentAuthProxyStack, '']
+  HasNewRelic: !Not [!Equals [!Ref NewRelicLicenseKey, '']]
+  HasAlertTopic: !Not [!Equals [!Ref ParentAlertStack, '']]
+Resources:
+  WebServerLogs:
+    Type: 'AWS::Logs::LogGroup'
+    Properties:
+      RetentionInDays: !Ref WebServerLogsRetentionInDays
+  LoadBalancerSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: 'wordpress-elb'
+      VpcId:
+        'Fn::ImportValue': !Sub '${ParentVPCStack}-VPC'
+  LoadBalancerSecurityGroupInWorld:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Condition: HasNotAuthProxySecurityGroup
+    Properties:
+      GroupId: !Ref LoadBalancerSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      CidrIp: '0.0.0.0/0'
+  LoadBalancerSecurityGroupInAuthProxy:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Condition: HasAuthProxySecurityGroup
+    Properties:
+      GroupId: !Ref LoadBalancerSecurityGroup
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      SourceSecurityGroupId:
+        'Fn::ImportValue': !Sub '${ParentAuthProxyStack}-SecurityGroup'
+  WebServerSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: 'wordpress-ec2'
+      VpcId:
+        'Fn::ImportValue': !Sub '${ParentVPCStack}-VPC'
+      SecurityGroupIngress:
+      - FromPort: 80
+        IpProtocol: tcp
+        SourceSecurityGroupId: !Ref LoadBalancerSecurityGroup
+        ToPort: 80
+  WebServerSecurityGroupInSSHBastion:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Condition: HasSSHBastionSecurityGroup
+    Properties:
+      GroupId: !Ref WebServerSecurityGroup
+      IpProtocol: tcp
+      FromPort: 22
+      ToPort: 22
+      SourceSecurityGroupId:
+        'Fn::ImportValue': !Sub '${ParentSSHBastionStack}-SecurityGroup'
+  WebServerSecurityGroupInSSHWorld:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Condition: HasNotSSHBastionSecurityGroup
+    Properties:
+      GroupId: !Ref WebServerSecurityGroup
+      IpProtocol: tcp
+      FromPort: 22
+      ToPort: 22
+      CidrIp: '0.0.0.0/0'
+  DatabaseSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: 'wordpress-rds'
+      VpcId:
+        'Fn::ImportValue': !Sub '${ParentVPCStack}-VPC'
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 3306
+        ToPort: 3306
+        SourceSecurityGroupId: !Ref WebServerSecurityGroup
+  HTTPCodeELB5XXTooHighAlarm:
+    Condition: HasAlertTopic
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmDescription: 'Elastic load balancer returns 5XX HTTP status codes'
+      Namespace: 'AWS/ELB'
+      MetricName: HTTPCode_ELB_5XX
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: 0
+      AlarmActions:
+      - 'Fn::ImportValue': !Sub '${ParentAlertStack}-TopicARN'
+      Dimensions:
+      - Name: LoadBalancerName
+        Value: !Ref LoadBalancer
+  HTTPCodeTarget5XXTooHighAlarm:
+    Condition: HasAlertTopic
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmDescription: 'Elastic load balancer receives 5XX HTTP status codes from backends'
+      Namespace: 'AWS/ELB'
+      MetricName: HTTPCode_Backend_5XX
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: 0
+      AlarmActions:
+      - 'Fn::ImportValue': !Sub '${ParentAlertStack}-TopicARN'
+      Dimensions:
+      - Name: LoadBalancerName
+        Value: !Ref LoadBalancer
+  LoadBalancer:
+    Type: 'AWS::ElasticLoadBalancing::LoadBalancer'
+    Properties:
+      Subnets:
+      - 'Fn::ImportValue': !Sub '${ParentVPCStack}-SubnetAPublic'
+      - 'Fn::ImportValue': !Sub '${ParentVPCStack}-SubnetBPublic'
+      Listeners:
+      - InstancePort: 80
+        InstanceProtocol: HTTP
+        LoadBalancerPort: 443
+        Protocol: HTTPS
+        SSLCertificateId: !Ref ElbAcmCertificate
+      HealthCheck:
+        HealthyThreshold: 2
+        Interval: 5
+        Target: 'TCP:80'
+        Timeout: 3
+        UnhealthyThreshold: 2
+      SecurityGroups:
+      - !Ref LoadBalancerSecurityGroup
+      Scheme: 'internet-facing'
+      CrossZone: true
+  DBSubnetGroup:
+    Type: 'AWS::RDS::DBSubnetGroup'
+    Properties:
+      DBSubnetGroupDescription: 'DB subnet group'
+      SubnetIds:
+      - 'Fn::ImportValue': !Sub '${ParentVPCStack}-SubnetAPrivate'
+      - 'Fn::ImportValue': !Sub '${ParentVPCStack}-SubnetBPrivate'
+  Database:
+    Type: 'AWS::RDS::DBInstance'
+    Properties:
+      AllocatedStorage: 5
+      BackupRetentionPeriod: 0
+      DBInstanceClass: !Ref DBServerInstanceType
+      DBName: wordpress
+      Engine: MySQL
+      MasterUsername: wordpress
+      MasterUserPassword: wordpress
+      VPCSecurityGroups:
+      - !Ref DatabaseSecurityGroup
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      MultiAZ: true
+      StorageType: gp2
+  WebServerInstanceProfile:
+    Type: 'AWS::IAM::InstanceProfile'
+    Properties:
+      Path: '/'
+      Roles:
+      - !Ref WebServerIAMRole
+  WebServerIAMRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - 'ec2.amazonaws.com'
+          Action:
+          - 'sts:AssumeRole'
+      Path: '/'
+      Policies:
+      - PolicyName: logs
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - 'logs:CreateLogGroup'
+            - 'logs:CreateLogStream'
+            - 'logs:PutLogEvents'
+            - 'logs:DescribeLogStreams'
+            Resource:
+            - 'arn:aws:logs:*:*:*'
+  WebServerIAMPolicySSHAccess:
+    Type: 'AWS::IAM::Policy'
+    Condition: HasIAMUserSSHAccess
+    Properties:
+      Roles:
+      - !Ref WebServerIAMRole
+      PolicyName: iam
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Action:
+          - 'iam:ListUsers'
+          Resource:
+          - '*'
+        - Effect: Allow
+          Action:
+          - 'iam:ListSSHPublicKeys'
+          - 'iam:GetSSHPublicKey'
+          Resource:
+          - !Sub 'arn:aws:iam::${AWS::AccountId}:user/*'
+  LaunchConfiguration:
+    Type: 'AWS::AutoScaling::LaunchConfiguration'
+    Metadata:
+      'AWS::CloudFormation::Init':
+        configSets:
+          default:
+            !If
+            - HasNewRelic
+            - !If [HasIAMUserSSHAccess, [ssh-access, newrelic, config], [newrelic, config]]
+            - !If [HasIAMUserSSHAccess, [ssh-access, config], [config]]
+        newrelic:
+          packages:
+            rpm:
+              newrelic-sysmond: 'https://download.newrelic.com/pub/newrelic/el5/x86_64/newrelic-sysmond-2.3.0.132-1.x86_64.rpm'
+          files:
+            '/etc/newrelic/nrsysmond.cfg':
+              content: !Sub |
+                license_key=${NewRelicLicenseKey}
+                loglevel=info
+                logfile=/var/log/newrelic/nrsysmond.log
+                labels=StackName:${AWS::StackName};AccountId:${AWS::AccountId};Region:${AWS::Region}
+              mode: '000640'
+              owner: root
+              group: newrelic
+          services:
+            sysvinit:
+              newrelic-sysmond:
+                enabled: true
+                ensureRunning: true
+                files:
+                - '/etc/newrelic/nrsysmond.cfg'
+        ssh-access:
+          files:
+            '/opt/authorized_keys_command.sh':
+              content: |
+                #!/bin/bash -e
+                if [ -z "$1" ]; then
+                  exit 1
+                fi
+                SaveUserName="$1"
+                SaveUserName=${SaveUserName//"+"/".plus."}
+                SaveUserName=${SaveUserName//"="/".equal."}
+                SaveUserName=${SaveUserName//","/".comma."}
+                SaveUserName=${SaveUserName//"@"/".at."}
+                aws iam list-ssh-public-keys --user-name "$SaveUserName" --query "SSHPublicKeys[?Status == 'Active'].[SSHPublicKeyId]" --output text | while read KeyId; do
+                  aws iam get-ssh-public-key --user-name "$SaveUserName" --ssh-public-key-id "$KeyId" --encoding SSH --query "SSHPublicKey.SSHPublicKeyBody" --output text
+                done
+              mode: '000755'
+              owner: root
+              group: root
+            '/opt/import_users.sh':
+              content: |
+                #!/bin/bash -e
+                aws iam list-users --query "Users[].[UserName]" --output text | while read User; do
+                  SaveUserName="$User"
+                  SaveUserName=${SaveUserName//"+"/".plus."}
+                  SaveUserName=${SaveUserName//"="/".equal."}
+                  SaveUserName=${SaveUserName//","/".comma."}
+                  SaveUserName=${SaveUserName//"@"/".at."}
+                  if ! id -u "$SaveUserName" >/dev/null 2>&1; then
+                    #sudo will read each file in /etc/sudoers.d, skipping file names that end in ‘~’ or contain a ‘.’ character to avoid causing problems with package manager or editor temporary/backup files.
+                    SaveUserFileName=$(echo "$SaveUserName" | tr "." " ")
+                    /usr/sbin/useradd "$SaveUserName"
+                    echo "$SaveUserName ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/$SaveUserFileName"
+                  fi
+                done
+              mode: '000755'
+              owner: root
+              group: root
+            '/etc/cron.d/import_users':
+              content: |
+                */10 * * * * root /opt/import_users.sh
+              mode: '000644'
+              owner: root
+              group: root
+          commands:
+            'a_configure_sshd_command':
+              command: 'sed -i "s:#AuthorizedKeysCommand none:AuthorizedKeysCommand /opt/authorized_keys_command.sh:g" /etc/ssh/sshd_config'
+            'b_configure_sshd_commanduser':
+              command: 'sed -i "s:#AuthorizedKeysCommandUser nobody:AuthorizedKeysCommandUser nobody:g" /etc/ssh/sshd_config'
+            'c_import_users':
+              command: './import_users.sh'
+              cwd: '/opt'
+          services:
+            sysvinit:
+              sshd:
+                enabled: true
+                ensureRunning: true
+                commands:
+                - 'a_configure_sshd_command'
+                - 'b_configure_sshd_commanduser'
+        config:
+          packages:
+            yum:
+              php70: []
+              php70-opcache: []
+              php70-mysqlnd: []
+              mysql56: []
+              httpd24: []
+              awslogs: []
+          files:
+            '/root/php.sh':
+              content: !Sub |
+                #!/bin/bash -ex
+                sed -i 's/;opcache.revalidate_freq=2/opcache.revalidate_freq=300/g' /etc/php-7.0.d/10-opcache.ini
+              mode: '000500'
+              owner: root
+              group: root
+            '/etc/httpd/conf.d/wordpress.conf':
+              content: !Sub |
+                <Directory "/var/www/html">
+                Options Indexes FollowSymLinks
+                AllowOverride All
+                Require all granted
+                </Directory>
+              mode: '000500'
+              owner: root
+              group: root
+            '/root/wordpress.sh':
+              content: !Sub |
+                #!/bin/bash -ex
+                # ensure than only one machine installs wp
+                if mkdir /var/www/lock; then
+                  cd /var/www/html
+                  wget -q -T 60 https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar
+                  if ! php wp-cli.phar core is-installed --allow-root; then
+                    php wp-cli.phar core download --allow-root --version=${BlogVersion}
+                    php wp-cli.phar core config --dbname='wordpress' --dbuser='wordpress' --dbpass='wordpress' --dbhost='${Database.Endpoint.Address}' --allow-root
+                    php wp-cli.phar core install --url='https://${DomainName}' --title='${BlogTitle}' --admin_user='${BlogAdminUsername}' --admin_password='${BlogAdminPassword}' --admin_email='${BlogAdminEMail}' --skip-email --allow-root
+                    sed -i "/$table_prefix = 'wp_';/a\$_SERVER['HTTPS'] = 'on';" /var/www/html/wp-config.php 
+                  fi
+                  chown -R apache:apache /var/www/html
+                  chmod u+wrx /var/www/html/wp-content/*
+                  rm wp-cli.phar
+                fi
+              mode: '000500'
+              owner: root
+              group: root
+            '/etc/awslogs/awscli.conf':
+              content: !Sub |
+                [default]
+                region = ${AWS::Region}
+                [plugins]
+                cwlogs = cwlogs
+              mode: '000644'
+              owner: root
+              group: root
+            '/etc/awslogs/awslogs.conf':
+              content: !Sub |
+                [general]
+                state_file = /var/lib/awslogs/agent-state
+                [/var/log/messages]
+                datetime_format = %b %d %H:%M:%S
+                file = /var/log/messages
+                log_stream_name = {instance_id}/var/log/messages
+                log_group_name = ${WebServerLogs}
+                [/var/log/secure]
+                datetime_format = %b %d %H:%M:%S
+                file = /var/log/secure
+                log_stream_name = {instance_id}/var/log/secure
+                log_group_name = ${WebServerLogs}
+                [/var/log/cron]
+                datetime_format = %b %d %H:%M:%S
+                file = /var/log/cron
+                log_stream_name = {instance_id}/var/log/cron
+                log_group_name = ${WebServerLogs}
+                [/var/log/cloud-init.log]
+                datetime_format = %b %d %H:%M:%S
+                file = /var/log/cloud-init.log
+                log_stream_name = {instance_id}/var/log/cloud-init.log
+                log_group_name = ${WebServerLogs}
+                [/var/log/cfn-init.log]
+                datetime_format = %Y-%m-%d %H:%M:%S
+                file = /var/log/cfn-init.log
+                log_stream_name = {instance_id}/var/log/cfn-init.log
+                log_group_name = ${WebServerLogs}
+                [/var/log/cfn-hup.log]
+                datetime_format = %Y-%m-%d %H:%M:%S
+                file = /var/log/cfn-hup.log
+                log_stream_name = {instance_id}/var/log/cfn-hup.log
+                log_group_name = ${WebServerLogs}
+                [/var/log/cfn-init-cmd.log]
+                datetime_format = %Y-%m-%d %H:%M:%S
+                file = /var/log/cfn-init-cmd.log
+                log_stream_name = {instance_id}/var/log/cfn-init-cmd.log
+                log_group_name = ${WebServerLogs}
+                [/var/log/cloud-init-output.log]
+                file = /var/log/cloud-init-output.log
+                log_stream_name = {instance_id}/var/log/cloud-init-output.log
+                log_group_name = ${WebServerLogs}
+                [/var/log/dmesg]
+                file = /var/log/dmesg
+                log_stream_name = {instance_id}/var/log/dmesg
+                log_group_name = ${WebServerLogs}
+                [/var/log/httpd/access_log]
+                datetime_format = %b %d %H:%M:%S %Y
+                file = /var/log/httpd/access_log
+                log_stream_name = {instance_id}/var/log/httpd/access_log
+                log_group_name = ${WebServerLogs}
+                [/var/log/httpd/error_log]
+                datetime_format = %d/%b/%Y:%H:%M:%S %z
+                file = /var/log/httpd/error_log
+                log_stream_name = {instance_id}/var/log/httpd/error_log
+                log_group_name = ${WebServerLogs}
+              mode: '000644'
+              owner: root
+              group: root
+          commands:
+            01_php:
+              command: '/root/php.sh'
+              cwd: '/var/www/html'
+            02_wordpress:
+              command: '/root/wordpress.sh'
+              cwd: '/var/www/html'
+          services:
+            sysvinit:
+              httpd:
+                enabled: true
+                ensureRunning: true
+              awslogs:
+                enabled: true
+                ensureRunning: true
+                packages:
+                  yum:
+                  - awslogs
+                files:
+                - '/etc/awslogs/awslogs.conf'
+                - '/etc/awslogs/awscli.conf'
+    Properties:
+      AssociatePublicIpAddress: true
+      IamInstanceProfile: !Ref WebServerInstanceProfile
+      ImageId: !FindInMap [RegionMap, !Ref 'AWS::Region', AMI]
+      InstanceType: !Ref WebServerInstanceType
+      SecurityGroups:
+      - !Ref WebServerSecurityGroup
+      KeyName: !If [HasKeyName, !Ref WebServerKeyName, !Ref 'AWS::NoValue']
+      UserData:
+        'Fn::Base64': !Sub |
+          #!/bin/bash -x
+          mkdir /var/www && mount -t nfs4 -o nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2 "${EFSFileSystem}.efs.${AWS::Region}.amazonaws.com:/" /var/www/ && /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource LaunchConfiguration --region ${AWS::Region}
+          /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource AutoScalingGroup --region ${AWS::Region}
+  AutoScalingGroup:
+    Type: 'AWS::AutoScaling::AutoScalingGroup'
+    DependsOn:
+    - EFSMountTargetA
+    - EFSMountTargetB
+    Properties:
+      LoadBalancerNames:
+      - !Ref LoadBalancer
+      LaunchConfigurationName: !Ref LaunchConfiguration
+      MinSize: 2
+      MaxSize: 4
+      DesiredCapacity: 2
+      Cooldown: 60
+      HealthCheckGracePeriod: 300
+      HealthCheckType: ELB
+      VPCZoneIdentifier:
+      - 'Fn::ImportValue': !Sub '${ParentVPCStack}-SubnetAPublic'
+      - 'Fn::ImportValue': !Sub '${ParentVPCStack}-SubnetBPublic'
+      Tags:
+      - PropagateAtLaunch: true
+        Value: wordpress
+        Key: Name
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT10M
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        PauseTime: PT10M
+        WaitOnResourceSignals: true
+  CPUTooHighAlarm:
+    Condition: HasAlertTopic
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmDescription: 'Average CPU utilization over last 10 minutes higher than 80%'
+      Namespace: 'AWS/EC2'
+      MetricName: CPUUtilization
+      Statistic: Average
+      Period: 600
+      EvaluationPeriods: 1
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: 80
+      AlarmActions:
+      - 'Fn::ImportValue': !Sub '${ParentAlertStack}-TopicARN'
+      Dimensions:
+      - Name: AutoScalingGroupName
+        Value: !Ref AutoScalingGroup
+  ScalingUpPolicy:
+    Type: 'AWS::AutoScaling::ScalingPolicy'
+    Properties:
+      AdjustmentType: PercentChangeInCapacity
+      MinAdjustmentStep: 1
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      Cooldown: 900
+      ScalingAdjustment: 25
+  CPUHighAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      EvaluationPeriods: 1
+      Statistic: Average
+      Threshold: 60
+      AlarmDescription: 'Alarm if CPU load is high.'
+      Period: 300
+      AlarmActions:
+      - !Ref ScalingUpPolicy
+      Namespace: 'AWS/EC2'
+      Dimensions:
+      - Name: AutoScalingGroupName
+        Value: !Ref AutoScalingGroup
+      ComparisonOperator: GreaterThanThreshold
+      MetricName: CPUUtilization
+  ScalingDownPolicy:
+    Type: 'AWS::AutoScaling::ScalingPolicy'
+    Properties:
+      AdjustmentType: PercentChangeInCapacity
+      MinAdjustmentStep: 1
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      Cooldown: 300
+      ScalingAdjustment: -25
+  CPULowAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      EvaluationPeriods: 3
+      Statistic: Average
+      Threshold: 30
+      AlarmDescription: 'Alarm if CPU load is low.'
+      Period: 300
+      AlarmActions:
+      - !Ref ScalingDownPolicy
+      Namespace: 'AWS/EC2'
+      Dimensions:
+      - Name: AutoScalingGroupName
+        Value: !Ref AutoScalingGroup
+      ComparisonOperator: LessThanThreshold
+      MetricName: CPUUtilization
+  EFSFileSystem:
+    Type: AWS::EFS::FileSystem
+    Properties:
+      FileSystemTags:
+      - Key: Name
+        Value: !Sub '${AWS::StackName}-efs'
+  EFSMountTargetA:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref EFSFileSystem
+      SubnetId:
+        'Fn::ImportValue': !Sub '${ParentVPCStack}-SubnetAPublic'
+      SecurityGroups:
+      - !Ref EFSSecurityGroup
+  EFSMountTargetB:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref EFSFileSystem
+      SubnetId: 
+        'Fn::ImportValue': !Sub '${ParentVPCStack}-SubnetBPublic'
+      SecurityGroups:
+      - !Ref EFSSecurityGroup
+  EFSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allowing access to EFS
+      VpcId: 
+        'Fn::ImportValue': !Sub '${ParentVPCStack}-VPC'
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 2049
+        ToPort: 2049
+        SourceSecurityGroupId: !Ref WebServerSecurityGroup
+  CloudFrontDistribution:
+    Type: 'AWS::CloudFront::Distribution'
+    Properties:
+      DistributionConfig:
+        Aliases:
+        - !Ref DomainName
+        Comment: !Ref DomainName
+        Origins:
+        - DomainName: !GetAtt 'LoadBalancer.DNSName'
+          Id: elb
+          CustomOriginConfig:
+            OriginProtocolPolicy: 'https-only'
+        DefaultCacheBehavior:
+          AllowedMethods:
+          - DELETE
+          - GET
+          - HEAD
+          - OPTIONS
+          - PATCH
+          - POST
+          - PUT
+          DefaultTTL: 0
+          MaxTTL: 0
+          MinTTL: 0
+          ForwardedValues:
+            QueryString: true
+            Headers:
+            - '*'
+            Cookies:
+              Forward: all
+          TargetOriginId: elb
+          ViewerProtocolPolicy: 'redirect-to-https'
+          Compress: true
+        CacheBehaviors:
+        - PathPattern: wp-includes/*
+          AllowedMethods:
+          - DELETE
+          - GET
+          - HEAD
+          - OPTIONS
+          - PATCH
+          - POST
+          - PUT
+          DefaultTTL: 900
+          MaxTTL: 900
+          MinTTL: 900
+          ForwardedValues:
+            QueryString: true
+            Headers:
+            - 'Host'
+          TargetOriginId: elb
+          ViewerProtocolPolicy: 'redirect-to-https'
+          Compress: true
+        - PathPattern: wp-content/*
+          AllowedMethods:
+          - DELETE
+          - GET
+          - HEAD
+          - OPTIONS
+          - PATCH
+          - POST
+          - PUT
+          DefaultTTL: 900
+          MaxTTL: 900
+          MinTTL: 900
+          ForwardedValues:
+            QueryString: true
+            Headers:
+            - 'Host'
+          TargetOriginId: elb
+          ViewerProtocolPolicy: 'redirect-to-https'
+          Compress: true
+        Enabled: true
+        HttpVersion: http2
+        PriceClass: 'PriceClass_All'
+        ViewerCertificate:
+          AcmCertificateArn: !Ref CloudFrontAcmCertificate
+          SslSupportMethod: 'sni-only'
+          MinimumProtocolVersion: TLSv1
+Outputs:
+  TemplateID:
+    Description: 'cloudonaut.io template id'
+    Value: 'wordpress/wordpress-ha'
+  CloudFrontID:
+    Description: 'The ID of the CloudFront distribution.'
+    Value: !Ref CloudFrontDistribution
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudFrontARN'
+  CloudFrontDomainName:
+    Description: 'The domain name of the CloudFront distribution.'
+    Value: !Sub ${CloudFrontDistribution.DomainName}
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudFrontDomainName'
